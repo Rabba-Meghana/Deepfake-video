@@ -155,8 +155,7 @@ async def detect(
             try:
                 from groq import Groq
                 client = Groq(api_key=groq_key)
-                segs_text = "
-".join([
+                segs_text = "\n".join([
                     f"- t={s['start_time']}s-{s['end_time']}s [{s['confidence']}]: {', '.join(s['triggered_signals'])} (peak z={s['peak_z_score']})"
                     for s in response["anomaly_segments"]
                 ])
