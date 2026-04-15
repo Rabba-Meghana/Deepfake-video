@@ -251,6 +251,19 @@ export default function App() {
               <div style={{ fontSize:13, color:"#374151" }}>{result.summary}</div>
             </div>
 
+            {/* Groq Forensic Explanation */}
+            {result.forensic_explanation && (
+              <div style={{ background:'#f0fdf4', border:'1px solid #86efac', borderRadius:10,
+                            padding:'14px 16px', marginBottom:20 }}>
+                <div style={{ fontWeight:700, fontSize:13, color:'#166534', marginBottom:6 }}>
+                  🧠 Groq LLaMA Forensic Analysis
+                </div>
+                <div style={{ fontSize:13, color:'#14532d', lineHeight:1.6 }}>
+                  {result.forensic_explanation}
+                </div>
+              </div>
+            )}
+
             {/* Phoneme-Viseme Signal 6 */}
             <PhonemeVisemePanel
               report={result.phoneme_viseme_report}

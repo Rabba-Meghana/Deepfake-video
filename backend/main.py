@@ -149,7 +149,51 @@ async def detect(
         logger.info(f"Detecting: {file.filename} ({len(content)//1024}KB) groq={'yes' if groq_key else 'no'}")
         det    = FauxPixDetector(groq_api_key=groq_key)
         result = det.detect(tmp_path)
-        return JSONResponse(json.loads(json.dumps(make_response(result), cls=NumpyEncoder)))
+        response = json.loads(json.dumps(make_response(result), cls=NumpyEncoder))
+        # Add Groq LLM forensic explanation if key available and segments found
+        if groq_key and response["anomaly_segments"]:
+            try:
+                from groq import Groq
+                client = Groq(api_key=groq_key)
+                segs_text = "
+".join([
+                    f"- t={s['start_time']}s-{s['end_time']}s [{s['confidence']}]: {', '.join(s['triggered_signals'])} (peak z={s['peak_z_score']})"
+                    for s in response["anomaly_segments"]
+                ])
+                pv_text = ""
+                if response.get("phoneme_viseme_report"):
+                    pv = response["phoneme_viseme_report"]
+                    pv_text = f"Phoneme-viseme analysis: {pv['mismatch_count']}/{pv['word_count']} word mismatches. Transcript: '{pv['transcript'][:200]}'"
+                prompt = f"""You are a forensic video analyst. A deepfake detection system analyzed a video and found:
+
+Verdict: {response['verdict']} (confidence: {response['overall_confidence']*100:.0f}%)
+Duration: {response['video_info']['duration_sec']}s at {response['video_info']['fps']}fps
+
+Anomaly segments detected:
+{segs_text}
+
+{pv_text}
+
+Signal explanations:
+- lip_sync_anomaly: lip geometry deviated from clip baseline (phoneme-viseme mismatch proxy)
+- texture_smoothing: face texture over-smoothed (GAN/neural synthesis signature)  
+- gan_frequency_artifact: periodic peaks in FFT spectrum (GAN upsampling fingerprint)
+- landmark_jitter: facial landmark micro-jitter between frames (Facial Feature Drift)
+- temporal_gradient_anomaly: face region motion inconsistent with background
+- phoneme_viseme_mismatch: Groq Whisper confirmed audio phoneme does not match lip shape
+
+Write a 3-4 sentence forensic explanation of these findings for a law enforcement audience. Be specific about timestamps and what each signal means. If phoneme-viseme shows 0 mismatches, note that audio-visual sync appears authentic. Be honest if results are ambiguous."""
+                chat = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role":"user","content":prompt}],
+                    max_tokens=300,
+                )
+                response["forensic_explanation"] = chat.choices[0].message.content
+                logger.info("Groq forensic explanation generated")
+            except Exception as e:
+                logger.warning(f"Groq explanation failed: {e}")
+                response["forensic_explanation"] = None
+        return JSONResponse(response)
     except Exception as e:
         logger.error(f"Detection error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
