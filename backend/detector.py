@@ -356,11 +356,17 @@ class FauxPixDetector:
     """
 
     THRESHOLDS = {
-        "lip_aspect_ratio":        2.8,
-        "laplacian_var":           2.8,
-        "fft_peak_score":          2.8,
-        "landmark_velocity":       3.0,
-        "temporal_gradient":       2.8,
+        # Raised to reduce false positives on real video:
+        # - Landmark velocity: natural head movement/gestures fire at 3.0; need 3.8+
+        # - Temporal gradient: normal face motion vs background fires at 2.8; need 3.5+
+        # - FFT/texture: real camera compression artifacts fire at 2.8; need 3.5+
+        # - Lip geometry: natural mouth movement fires at 2.8; need 3.2+
+        # - PV mismatch: kept sensitive since this is the gold-standard signal
+        "lip_aspect_ratio":        3.2,
+        "laplacian_var":           3.5,
+        "fft_peak_score":          3.5,
+        "landmark_velocity":       3.8,
+        "temporal_gradient":       3.5,
         "phoneme_viseme_mismatch": 1.8,
     }
     WEIGHTS = {"lip_ar":0.20, "lap":0.12, "fft":0.12, "vel":0.20, "tg":0.12, "pv":0.24}
@@ -498,7 +504,7 @@ class FauxPixDetector:
 
         # ── Peak detection ────────────────────────────────────────────────────
         diff_sig = np.abs(np.diff(np.array(comp_z), prepend=comp_z[0]))
-        peaks, _ = find_peaks(diff_sig, height=2.5, distance=int(fps*1.0))
+        peaks, _ = find_peaks(diff_sig, height=3.2, distance=int(fps*1.0))
 
         # ── Anomaly segments ──────────────────────────────────────────────────
         segments: List[AnomalySegment] = []
@@ -523,6 +529,11 @@ class FauxPixDetector:
                 flag("tg","temporal_gradient_anomaly")
                 if has_groq: flag("pv","phoneme_viseme_mismatch")
             if not triggered:
+                continue
+            # Require at least 2 corroborating signals — single-signal hits are
+            # likely natural movement / compression artifacts, not manipulation.
+            # (Exception: phoneme-viseme mismatch is high-specificity — counts alone)
+            if len(triggered) < 2 and "phoneme_viseme_mismatch" not in triggered:
                 continue
             conf   = "high" if len(triggered)>=3 else "medium" if len(triggered)==2 else "low"
             ts_    = feats[ws].timestamp
