@@ -6,9 +6,17 @@ Accepts GROQ_API_KEY via env var or X-Groq-Api-Key header.
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import tempfile, os, logging
+import tempfile, os, logging, json
+import numpy as np
 from typing import Optional
 from detector import FauxPixDetector, DetectionResult
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        return super().default(obj)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -141,7 +149,7 @@ async def detect(
         logger.info(f"Detecting: {file.filename} ({len(content)//1024}KB) groq={'yes' if groq_key else 'no'}")
         det    = FauxPixDetector(groq_api_key=groq_key)
         result = det.detect(tmp_path)
-        return JSONResponse(make_response(result))
+        return JSONResponse(json.loads(json.dumps(make_response(result), cls=NumpyEncoder)))
     except Exception as e:
         logger.error(f"Detection error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
