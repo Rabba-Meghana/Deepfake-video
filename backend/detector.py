@@ -4,16 +4,22 @@ FauxPix — Partial Video Deepfake Detector
 Signal-processing-first pipeline for segment-level video deepfake detection.
 Detects WHERE in a video manipulation was injected, not just whether a clip is fake.
 
-6 signals:
+7 signals:
   1. Lip Geometry           — phoneme-viseme proxy (MediaPipe)
   2. Laplacian Variance     — GAN texture over-smoothing
   3. FFT Peak Score         — GAN frequency fingerprint
   4. Landmark Velocity      — Facial Feature Drift (FFD)
   5. Temporal Gradient      — face vs background motion ratio
   6. Phoneme-Viseme Sync    — Groq Whisper word timestamps x lip geometry
+  7. Periodicity / Splice   — cross-frame rolling window: GAN rhythm + splice boundary
 
-Key design: ALL signals z-scored against the clip's OWN baseline.
-Robust to compression, noise, body cam quality.
+Key design:
+  - ALL signals z-scored against the clip's OWN baseline (like audio detector)
+  - Signal 7 compares FRAMES AGAINST EACH OTHER via sliding windows — not just
+    vs the global mean. This catches GAN period (~12-frame repeating artifacts)
+    and hard splice boundaries where signal statistics shift abruptly.
+  - Minimum 2 corroborating signals required for MANIPULATED verdict.
+    Phoneme-viseme mismatch or splice_boundary alone are high-specificity exceptions.
 
 Author: Meghana Rabba — Illinois Institute of Technology / BLK-BX Research
 """
@@ -22,27 +28,21 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from scipy.signal import find_peaks
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 import subprocess, tempfile, os, time, logging
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phoneme -> viseme -> expected lip aspect ratio
-# Based on Jeffers & Barley (1971) viseme classification.
-# LAR = lip vertical opening / lip width
-# ─────────────────────────────────────────────────────────────────────────────
-
 VISEME_LAR_EXPECTED = {
-    "bilabial_stop":  (0.00, 0.06),   # b, p  — lips must close
-    "bilabial_nasal": (0.00, 0.06),   # m     — lips must close
-    "labiodental":    (0.00, 0.08),   # f, v  — near-closed
-    "open_vowel":     (0.15, 0.55),   # a, ah — wide open
-    "mid_vowel":      (0.08, 0.30),   # e, ay
-    "close_vowel":    (0.02, 0.12),   # i, ee, oo, u
-    "sibilant":       (0.04, 0.18),   # s, z, sh
+    "bilabial_stop":  (0.00, 0.06),
+    "bilabial_nasal": (0.00, 0.06),
+    "labiodental":    (0.00, 0.08),
+    "open_vowel":     (0.15, 0.55),
+    "mid_vowel":      (0.08, 0.30),
+    "close_vowel":    (0.02, 0.12),
+    "sibilant":       (0.04, 0.18),
     "other":          (0.02, 0.25),
 }
 
@@ -57,10 +57,6 @@ def phoneme_to_viseme(word: str) -> str:
     if first in ("s","z"):    return "sibilant"
     return "other"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data structures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class WordTimestamp:
@@ -83,6 +79,8 @@ class FrameFeatures:
     landmark_velocity: float = 0.0
     temporal_gradient: float = 0.0
     phoneme_viseme_mismatch: float = 0.0
+    periodicity_score: float = 0.0
+    splice_score: float = 0.0
     composite_score: float = 0.0
     composite_z: float = 0.0
 
@@ -125,12 +123,7 @@ class DetectionResult:
     groq_transcript: Optional[str] = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Signal extractors
-# ─────────────────────────────────────────────────────────────────────────────
-
 class LipGeometryExtractor:
-    """Signal 1 — Lip aspect ratio per frame."""
     def extract(self, landmarks, frame_w: int, frame_h: int) -> Tuple[float, float]:
         if landmarks is None:
             return 0.0, 0.0
@@ -141,7 +134,6 @@ class LipGeometryExtractor:
 
 
 class TextureAnalyzer:
-    """Signal 2 — Laplacian variance (GAN over-smoothing)."""
     def extract(self, face_crop: np.ndarray) -> float:
         if face_crop is None or face_crop.size == 0:
             return 0.0
@@ -150,22 +142,20 @@ class TextureAnalyzer:
 
 
 class GANFrequencyAnalyzer:
-    """Signal 3 — FFT peak score (GAN frequency fingerprint)."""
     def extract(self, face_crop: np.ndarray) -> float:
         if face_crop is None or face_crop.size == 0:
             return 0.0
         gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY) if face_crop.ndim == 3 else face_crop
         if gray.shape[0] < 32 or gray.shape[1] < 32:
             return 0.0
-        resized   = cv2.resize(gray, (128, 128)).astype(np.float32)
-        mag       = np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(resized))))
-        h, w      = mag.shape
+        resized = cv2.resize(gray, (128, 128)).astype(np.float32)
+        mag     = np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(resized))))
+        h, w    = mag.shape
         mag[h//2-4:h//2+4, w//2-4:w//2+4] = 0
         return float(mag.max() / (mag.mean() + 1e-6))
 
 
 class LandmarkVelocityTracker:
-    """Signal 4 — Facial landmark velocity (Facial Feature Drift)."""
     KEY_POINTS = [1, 4, 33, 263, 61, 291, 199]
     def __init__(self):
         self.prev = None
@@ -185,7 +175,6 @@ class LandmarkVelocityTracker:
 
 
 class TemporalGradientAnalyzer:
-    """Signal 5 — Face vs background temporal gradient ratio."""
     def __init__(self):
         self.prev_frame = None
     def extract(self, frame: np.ndarray, face_bbox: Optional[Tuple]) -> float:
@@ -198,24 +187,86 @@ class TemporalGradientAnalyzer:
             return float(diff.mean())
         x, y, w, h = face_bbox
         face_diff = diff[y:y+h, x:x+w]
-        mask      = np.ones(diff.shape[:2], dtype=bool)
+        mask = np.ones(diff.shape[:2], dtype=bool)
         mask[y:y+h, x:x+w] = False
         return float(face_diff.mean() / (diff[mask].mean() + 1e-6))
 
 
+class PeriodicityAndSpliceAnalyzer:
+    """
+    Signal 7 — Cross-frame sliding window: frames compared AGAINST EACH OTHER.
+
+    A) PERIODICITY: GAN generators produce artifacts at a fixed frame interval
+       (typically 8-16 frames). Detected via autocorrelation of a multi-signal
+       feature vector. Real video autocorrelation decays to noise; GAN regions
+       show a persistent peak at a fixed lag.
+
+    B) SPLICE: When a deepfake is spliced into real footage, the statistics of
+       multiple signals shift abruptly at the boundary frame. Detected by
+       comparing a left window vs right window — high shift = splice boundary.
+    """
+    SPLICE_HALF_WINDOW = 15
+    PERIOD_LAGS = list(range(4, 25))
+
+    def compute_periodicity(self, feature_matrix: np.ndarray, fps: float) -> np.ndarray:
+        N = feature_matrix.shape[0]
+        scores = np.zeros(N)
+        normed = np.zeros_like(feature_matrix)
+        for col in range(feature_matrix.shape[1]):
+            col_data = feature_matrix[:, col]
+            mu, sig = col_data.mean(), col_data.std()
+            normed[:, col] = (col_data - mu) / (sig + 1e-8)
+
+        context = 60
+        for i in range(N):
+            lo = max(0, i - context)
+            hi = min(N, i + context)
+            window = normed[lo:hi]
+            if len(window) < max(self.PERIOD_LAGS) + 4:
+                continue
+            ac_vals = []
+            for lag in self.PERIOD_LAGS:
+                if lag >= len(window):
+                    continue
+                a = window[:-lag]
+                b = window[lag:]
+                col_corrs = []
+                for col in range(window.shape[1]):
+                    if a[:, col].std() < 1e-8 or b[:, col].std() < 1e-8:
+                        continue
+                    r = np.corrcoef(a[:, col], b[:, col])[0, 1]
+                    col_corrs.append(abs(r))
+                if col_corrs:
+                    ac_vals.append(np.mean(col_corrs))
+            if ac_vals:
+                ac_arr = np.array(ac_vals)
+                scores[i] = float(ac_arr.max() - ac_arr.mean())
+        return scores
+
+    def compute_splice(self, feature_matrix: np.ndarray) -> np.ndarray:
+        N = feature_matrix.shape[0]
+        scores = np.zeros(N)
+        W = self.SPLICE_HALF_WINDOW
+        normed = np.zeros_like(feature_matrix)
+        for col in range(feature_matrix.shape[1]):
+            col_data = feature_matrix[:, col]
+            mu, sig = col_data.mean(), col_data.std()
+            normed[:, col] = (col_data - mu) / (sig + 1e-8)
+
+        for i in range(W, N - W):
+            left  = normed[i-W:i]
+            right = normed[i:i+W]
+            col_scores = []
+            for col in range(normed.shape[1]):
+                mu_l, mu_r = left[:, col].mean(), right[:, col].mean()
+                std_l, std_r = left[:, col].std(), right[:, col].std()
+                pooled = np.sqrt((std_l**2 + std_r**2) / 2 + 1e-8)
+                col_scores.append(abs(mu_l - mu_r) / pooled)
+            scores[i] = float(np.mean(col_scores))
+        return scores
+
+
 class PhonemeVisemeMatcher:
-    """
-    Signal 6 — Phoneme-Viseme Synchrony via Groq Whisper
-    =====================================================
-    Uses Groq's whisper-large-v3-turbo (same API as your audio detector)
-    to get word-level timestamps, then checks whether actual lip shape
-    matches expected viseme for each spoken word.
-
-    This is the bridge between MAIA (audio) and FauxPix (video):
-    when both flag the same timestamp independently, you have
-    dual-modality forensic evidence.
-    """
-
     def __init__(self, groq_api_key: Optional[str] = None):
         self.groq_api_key = groq_api_key or os.environ.get("GROQ_API_KEY")
         self._client = None
@@ -282,15 +333,9 @@ class PhonemeVisemeMatcher:
             logger.warning(f"Word timestamp parse error: {e}")
         return words
 
-    def score_frames(
-        self,
-        frame_features: List[FrameFeatures],
-        word_timestamps: List[WordTimestamp],
-        fps: float,
-    ) -> Tuple[List[float], PhonemeVisemeReport, str]:
+    def score_frames(self, frame_features, word_timestamps, fps):
         scores     = [0.0] * len(frame_features)
         mismatches = []
-
         if not word_timestamps:
             return scores, PhonemeVisemeReport(
                 transcript="", word_count=0, mismatch_count=0,
@@ -298,7 +343,6 @@ class PhonemeVisemeMatcher:
                 error="No word timestamps"
             ), ""
 
-        # Map frame index -> word being spoken at that moment
         frame_word: Dict[int, WordTimestamp] = {}
         for wt in word_timestamps:
             for fi in range(int(wt.start * fps), min(int(wt.end * fps) + 1, len(frame_features))):
@@ -344,42 +388,53 @@ class PhonemeVisemeMatcher:
         return scores, report, transcript
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core detector
-# ─────────────────────────────────────────────────────────────────────────────
-
 class FauxPixDetector:
     """
-    6-signal segment-level partial video deepfake detector.
-    Per-clip self-referential z-scoring. Robust to noisy/compressed footage.
-    Signal 6 (Groq Whisper) requires GROQ_API_KEY env var or constructor arg.
+    7-signal segment-level partial video deepfake detector.
+
+    Signals 1-6: per-frame z-scored against clip baseline.
+    Signal 7:    cross-frame sliding window — compares frames AGAINST EACH OTHER
+                 to find GAN periodicity (rhythm) and splice boundaries (hard cuts).
+
+    Verdict:
+      MANIPULATED   — 2+ signals corroborate, OR high-specificity signal alone
+                      (phoneme-viseme mismatch, splice_boundary)
+      INCONCLUSIVE  — 1 low-specificity signal only
+      AUTHENTIC     — no signals triggered
     """
 
     THRESHOLDS = {
-        # Raised to reduce false positives on real video:
-        # - Landmark velocity: natural head movement/gestures fire at 3.0; need 3.8+
-        # - Temporal gradient: normal face motion vs background fires at 2.8; need 3.5+
-        # - FFT/texture: real camera compression artifacts fire at 2.8; need 3.5+
-        # - Lip geometry: natural mouth movement fires at 2.8; need 3.2+
-        # - PV mismatch: kept sensitive since this is the gold-standard signal
         "lip_aspect_ratio":        3.2,
         "laplacian_var":           3.5,
         "fft_peak_score":          3.5,
         "landmark_velocity":       3.8,
         "temporal_gradient":       3.5,
         "phoneme_viseme_mismatch": 1.8,
+        "periodicity":             0.25,
+        "splice":                  2.5,
     }
-    WEIGHTS = {"lip_ar":0.20, "lap":0.12, "fft":0.12, "vel":0.20, "tg":0.12, "pv":0.24}
+
+    WEIGHTS = {
+        "lip_ar": 0.15,
+        "lap":    0.10,
+        "fft":    0.10,
+        "vel":    0.15,
+        "tg":     0.10,
+        "pv":     0.20,
+        "period": 0.10,
+        "splice": 0.10,
+    }
 
     def __init__(self, groq_api_key: Optional[str] = None):
-        self.mp_face_mesh      = mp.solutions.face_mesh
-        self.mp_face_detection = mp.solutions.face_detection
-        self.lip_extractor     = LipGeometryExtractor()
-        self.texture_analyzer  = TextureAnalyzer()
-        self.fft_analyzer      = GANFrequencyAnalyzer()
-        self.landmark_tracker  = LandmarkVelocityTracker()
-        self.temporal_analyzer = TemporalGradientAnalyzer()
-        self.pv_matcher        = PhonemeVisemeMatcher(groq_api_key)
+        self.mp_face_mesh         = mp.solutions.face_mesh
+        self.mp_face_detection    = mp.solutions.face_detection
+        self.lip_extractor        = LipGeometryExtractor()
+        self.texture_analyzer     = TextureAnalyzer()
+        self.fft_analyzer         = GANFrequencyAnalyzer()
+        self.landmark_tracker     = LandmarkVelocityTracker()
+        self.temporal_analyzer    = TemporalGradientAnalyzer()
+        self.pv_matcher           = PhonemeVisemeMatcher(groq_api_key)
+        self.periodicity_analyzer = PeriodicityAndSpliceAnalyzer()
 
     def _get_face_bbox(self, detections, fw, fh):
         if not detections:
@@ -389,13 +444,7 @@ class FauxPixDetector:
         w, h = min(int(bb.width*fw), fw-x), min(int(bb.height*fh), fh-y)
         return (x, y, w, h)
 
-    def _zscore_series(self, values: List[float], baseline_frac: float = 0.3) -> List[float]:
-        """Per-clip self-referential z-scoring — same as audio detector.
-        Each frame scored against the GLOBAL clip mean/std (all frames).
-        This is how the audio detector works: every 0.5s window is compared
-        against the whole clip baseline, not a fixed region.
-        Robust to startup artifacts, lighting changes, compression noise.
-        """
+    def _zscore_series(self, values: List[float]) -> List[float]:
         arr = np.array(values, dtype=np.float64)
         mu  = arr.mean()
         sig = arr.std()
@@ -405,27 +454,34 @@ class FauxPixDetector:
 
     def _composite(self, i: int, zs: dict, has_groq: bool) -> float:
         w = self.WEIGHTS
-        if not has_groq:
+        score = (
+            abs(zs["lip_ar"][i]) * w["lip_ar"] +
+            abs(zs["lap"][i])    * w["lap"]    +
+            abs(zs["fft"][i])    * w["fft"]    +
+            abs(zs["vel"][i])    * w["vel"]    +
+            abs(zs["tg"][i])     * w["tg"]     +
+            abs(zs["period"][i]) * w["period"] +
+            abs(zs["splice"][i]) * w["splice"]
+        )
+        if has_groq:
+            score += abs(zs["pv"][i]) * w["pv"]
+        else:
             s = 1.0 - w["pv"]
-            return (abs(zs["lip_ar"][i])*w["lip_ar"] + abs(zs["lap"][i])*w["lap"] +
-                    abs(zs["fft"][i])*w["fft"]   + abs(zs["vel"][i])*w["vel"] +
-                    abs(zs["tg"][i])*w["tg"]) / s
-        return (abs(zs["lip_ar"][i])*w["lip_ar"] + abs(zs["lap"][i])*w["lap"] +
-                abs(zs["fft"][i])*w["fft"]   + abs(zs["vel"][i])*w["vel"] +
-                abs(zs["tg"][i])*w["tg"]     + abs(zs["pv"][i])*w["pv"])
+            score /= s
+        return score
 
     def detect(self, video_path: str) -> DetectionResult:
-        t0      = time.time()
-        cap     = cv2.VideoCapture(video_path)
-        fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        fw      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        fh      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        feats:  List[FrameFeatures] = []
+        t0  = time.time()
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        feats: List[FrameFeatures] = []
 
-        self.landmark_tracker.prev      = None
+        self.landmark_tracker.prev        = None
         self.temporal_analyzer.prev_frame = None
 
-        # ── Pass 1: visual signals ────────────────────────────────────────────
+        # ── Pass 1: visual signals 1-5 ────────────────────────────────────────
         with self.mp_face_mesh.FaceMesh(
             static_image_mode=False, max_num_faces=1, refine_landmarks=True,
             min_detection_confidence=0.4, min_tracking_confidence=0.4
@@ -437,17 +493,17 @@ class FauxPixDetector:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                dr        = det.process(rgb)
-                bbox      = self._get_face_bbox(dr.detections if dr.detections else [], fw, fh)
-                mr        = mesh.process(rgb)
-                lm        = mr.multi_face_landmarks[0] if mr.multi_face_landmarks else None
-                crop      = (frame[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]]
-                             if bbox and bbox[2]>0 and bbox[3]>0 else None)
-                ff        = FrameFeatures(frame_idx=fi, timestamp=fi/fps)
+                rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                dr   = det.process(rgb)
+                bbox = self._get_face_bbox(dr.detections if dr.detections else [], fw, fh)
+                mr   = mesh.process(rgb)
+                lm   = mr.multi_face_landmarks[0] if mr.multi_face_landmarks else None
+                crop = (frame[bbox[1]:bbox[1]+bbox[3], bbox[0]:bbox[0]+bbox[2]]
+                        if bbox and bbox[2]>0 and bbox[3]>0 else None)
+                ff   = FrameFeatures(frame_idx=fi, timestamp=fi/fps)
                 ff.lip_aspect_ratio, ff.lip_area = self.lip_extractor.extract(lm, fw, fh)
-                ff.laplacian_var    = self.texture_analyzer.extract(crop)
-                ff.fft_peak_score   = self.fft_analyzer.extract(crop)
+                ff.laplacian_var     = self.texture_analyzer.extract(crop)
+                ff.fft_peak_score    = self.fft_analyzer.extract(crop)
                 ff.landmark_velocity = self.landmark_tracker.extract(lm, fw, fh)
                 ff.temporal_gradient = self.temporal_analyzer.extract(frame, bbox)
                 feats.append(ff)
@@ -462,7 +518,20 @@ class FauxPixDetector:
                 total_frames=fi, fps=fps, summary="Insufficient frames."
             )
 
-        # ── Pass 2: Groq Whisper (Signal 6) ───────────────────────────────────
+        # ── Signal 7: cross-frame periodicity + splice ────────────────────────
+        feature_matrix = np.array([
+            [f.laplacian_var, f.fft_peak_score, f.landmark_velocity, f.temporal_gradient]
+            for f in feats
+        ], dtype=np.float64)
+
+        period_scores = self.periodicity_analyzer.compute_periodicity(feature_matrix, fps)
+        splice_scores = self.periodicity_analyzer.compute_splice(feature_matrix)
+
+        for i, ff in enumerate(feats):
+            ff.periodicity_score = float(period_scores[i])
+            ff.splice_score      = float(splice_scores[i])
+
+        # ── Pass 2: Groq Whisper Signal 6 ────────────────────────────────────
         pv_scores  = [0.0] * len(feats)
         pv_report  = None
         transcript = None
@@ -486,7 +555,7 @@ class FauxPixDetector:
         for i, ff in enumerate(feats):
             ff.phoneme_viseme_mismatch = pv_scores[i]
 
-        # ── Z-scoring ─────────────────────────────────────────────────────────
+        # ── Z-scoring all 7 signals ───────────────────────────────────────────
         zs = {
             "lip_ar": self._zscore_series([f.lip_aspect_ratio       for f in feats]),
             "lap":    self._zscore_series([f.laplacian_var           for f in feats]),
@@ -494,6 +563,8 @@ class FauxPixDetector:
             "vel":    self._zscore_series([f.landmark_velocity       for f in feats]),
             "tg":     self._zscore_series([f.temporal_gradient       for f in feats]),
             "pv":     self._zscore_series([f.phoneme_viseme_mismatch for f in feats]),
+            "period": self._zscore_series([f.periodicity_score       for f in feats]),
+            "splice": self._zscore_series([f.splice_score            for f in feats]),
         }
 
         for i, ff in enumerate(feats):
@@ -503,54 +574,81 @@ class FauxPixDetector:
             ff.composite_z = comp_z[i]
 
         # ── Peak detection ────────────────────────────────────────────────────
-        diff_sig = np.abs(np.diff(np.array(comp_z), prepend=comp_z[0]))
-        peaks, _ = find_peaks(diff_sig, height=3.2, distance=int(fps*1.0))
+        diff_sig   = np.abs(np.diff(np.array(comp_z), prepend=comp_z[0]))
+        diff_peaks, _ = find_peaks(diff_sig,          height=2.8, distance=int(fps*0.8))
+        comp_peaks, _ = find_peaks(np.array(comp_z),  height=2.5, distance=int(fps*0.8))
+        all_peaks  = sorted(set(diff_peaks.tolist() + comp_peaks.tolist()))
+
+        # Merge peaks within 1s of each other, keep highest
+        merged_peaks = []
+        for p in all_peaks:
+            if not merged_peaks or p - merged_peaks[-1] > int(fps):
+                merged_peaks.append(p)
+            elif abs(comp_z[p]) > abs(comp_z[merged_peaks[-1]]):
+                merged_peaks[-1] = p
 
         # ── Anomaly segments ──────────────────────────────────────────────────
         segments: List[AnomalySegment] = []
-        for pi in peaks:
+        thr = self.THRESHOLDS
+
+        for pi in merged_peaks:
             ws  = max(0, pi - int(fps*0.5))
             we  = min(len(feats)-1, pi + int(fps*1.0))
             pkz = max(abs(comp_z[i]) for i in range(ws, we+1))
+
             triggered = []
+
             for f in feats[ws:we+1]:
-                i2 = f.frame_idx
-                def flag(key, name):
-                    if abs(zs[key][i2]) > self.THRESHOLDS.get(
-                            {"lip_ar":"lip_aspect_ratio","lap":"laplacian_var",
-                             "fft":"fft_peak_score","vel":"landmark_velocity",
-                             "tg":"temporal_gradient","pv":"phoneme_viseme_mismatch"}[key], 2.0
-                        ) and name not in triggered:
+                idx = f.frame_idx
+                def _flag(key, zkey, name):
+                    if abs(zs[zkey][idx]) > thr[key] and name not in triggered:
                         triggered.append(name)
-                flag("lip_ar","lip_sync_anomaly")
-                flag("lap","texture_smoothing")
-                flag("fft","gan_frequency_artifact")
-                flag("vel","landmark_jitter")
-                flag("tg","temporal_gradient_anomaly")
-                if has_groq: flag("pv","phoneme_viseme_mismatch")
+                _flag("lip_aspect_ratio",        "lip_ar", "lip_sync_anomaly")
+                _flag("laplacian_var",            "lap",    "texture_smoothing")
+                _flag("fft_peak_score",           "fft",    "gan_frequency_artifact")
+                _flag("landmark_velocity",        "vel",    "landmark_jitter")
+                _flag("temporal_gradient",        "tg",     "temporal_gradient_anomaly")
+                if has_groq:
+                    _flag("phoneme_viseme_mismatch", "pv",  "phoneme_viseme_mismatch")
+
+            # Signal 7 — raw scores (not z-scores, already calibrated)
+            win_period = float(np.mean([feats[i].periodicity_score for i in range(ws, we+1)]))
+            win_splice = float(np.mean([feats[i].splice_score      for i in range(ws, we+1)]))
+            if win_period > thr["periodicity"]:
+                triggered.append("gan_periodicity")
+            if win_splice > thr["splice"]:
+                triggered.append("splice_boundary")
+
             if not triggered:
                 continue
-            # Require at least 2 corroborating signals — single-signal hits are
-            # likely natural movement / compression artifacts, not manipulation.
-            # (Exception: phoneme-viseme mismatch is high-specificity — counts alone)
-            if len(triggered) < 2 and "phoneme_viseme_mismatch" not in triggered:
-                continue
-            conf   = "high" if len(triggered)>=3 else "medium" if len(triggered)==2 else "low"
-            ts_    = feats[ws].timestamp
-            te_    = feats[we].timestamp
-            parts  = []
+
+            # High-specificity signals that count alone
+            high_spec = {"phoneme_viseme_mismatch", "splice_boundary"}
+            n_high = len([s for s in triggered if s in high_spec])
+            if n_high == 0 and len(triggered) < 2:
+                continue  # single low-spec signal — inconclusive, skip
+
+            conf  = "high" if len(triggered)>=3 else "medium" if len(triggered)==2 else "low"
+            ts_   = feats[ws].timestamp
+            te_   = feats[we].timestamp
+            parts = []
             if "phoneme_viseme_mismatch" in triggered:
                 parts.append(f"phoneme-viseme mismatch (z={abs(zs['pv'][pi]):.2f}) — Groq Whisper")
-            if "lip_sync_anomaly"        in triggered:
+            if "lip_sync_anomaly"          in triggered:
                 parts.append(f"lip geometry deviation (z={abs(zs['lip_ar'][pi]):.2f})")
-            if "landmark_jitter"         in triggered:
+            if "landmark_jitter"           in triggered:
                 parts.append(f"landmark velocity spike (z={abs(zs['vel'][pi]):.2f})")
-            if "texture_smoothing"       in triggered:
+            if "texture_smoothing"         in triggered:
                 parts.append(f"GAN texture smoothing (z={abs(zs['lap'][pi]):.2f})")
-            if "gan_frequency_artifact"  in triggered:
+            if "gan_frequency_artifact"    in triggered:
                 parts.append(f"GAN frequency fingerprint (z={abs(zs['fft'][pi]):.2f})")
             if "temporal_gradient_anomaly" in triggered:
                 parts.append(f"temporal gradient anomaly (z={abs(zs['tg'][pi]):.2f})")
+            if "gan_periodicity"           in triggered:
+                parts.append(f"GAN frame periodicity (autocorr={win_period:.3f})")
+            if "splice_boundary"           in triggered:
+                parts.append(f"splice boundary detected (shift={win_splice:.2f})")
+
             segments.append(AnomalySegment(
                 start_frame=ws, end_frame=we,
                 start_time=round(ts_,3), end_time=round(te_,3),
@@ -577,8 +675,8 @@ class FauxPixDetector:
 
         groq_note = (" (Groq Whisper phoneme-viseme: ACTIVE)" if has_groq
                      else " (Groq Whisper: not configured — set GROQ_API_KEY)")
-        summary   = (f"{verdict} — {len(segments)} anomaly segment(s) across "
-                     f"{fi} frames ({fi/fps:.1f}s). Confidence: {conf_:.0%}.{groq_note}")
+        summary = (f"{verdict} — {len(segments)} anomaly segment(s) across "
+                   f"{fi} frames ({fi/fps:.1f}s). Confidence: {conf_:.0%}.{groq_note}")
 
         return DetectionResult(
             verdict=verdict, overall_confidence=round(conf_,3),
@@ -590,6 +688,8 @@ class FauxPixDetector:
                 "landmark_velocity":       [round(z,3) for z in zs["vel"]],
                 "temporal_gradient":       [round(z,3) for z in zs["tg"]],
                 "phoneme_viseme_mismatch": [round(z,3) for z in zs["pv"]],
+                "periodicity":             [round(z,3) for z in zs["period"]],
+                "splice":                  [round(z,3) for z in zs["splice"]],
                 "composite":               [round(z,3) for z in comp_z],
             },
             phoneme_viseme_report=pv_report,
