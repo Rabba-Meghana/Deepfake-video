@@ -1,25 +1,30 @@
 """
-FauxPix — Partial Video Deepfake Detector
+FauxPix — Audio + Video Deepfake Detector
 ==========================================
-Signal-processing-first pipeline for segment-level video deepfake detection.
-Detects WHERE in a video manipulation was injected, not just whether a clip is fake.
+Combined audio-visual deepfake detection pipeline.
 
-7 signals:
+VIDEO — 7 signals:
   1. Lip Geometry           — phoneme-viseme proxy (MediaPipe)
   2. Laplacian Variance     — GAN texture over-smoothing
   3. FFT Peak Score         — GAN frequency fingerprint
   4. Landmark Velocity      — Facial Feature Drift (FFD)
   5. Temporal Gradient      — face vs background motion ratio
-  6. Phoneme-Viseme Sync    — Groq Whisper word timestamps x lip geometry
+  6. Phoneme-Viseme Sync    — Groq Whisper word timestamps × lip geometry
   7. Periodicity / Splice   — cross-frame rolling window: GAN rhythm + splice boundary
 
+AUDIO — 6 signals (parallel to MAIA):
+  A. F0 Jitter z-score      — pitch instability (TTS is too smooth)
+  B. HF Ratio z-score       — high-freq energy (GAN over-smoothing)
+  C. Spectral Flatness z    — noise floor flatness (neural codec artifacts)
+  D. MFCC Delta z-score     — mel-cepstral temporal drift
+  E. ZCR z-score            — zero-crossing rate anomalies
+  F. Splice Score           — audio cross-frame statistical shift
+
 Key design:
-  - ALL signals z-scored against the clip's OWN baseline (like audio detector)
-  - Signal 7 compares FRAMES AGAINST EACH OTHER via sliding windows — not just
-    vs the global mean. This catches GAN period (~12-frame repeating artifacts)
-    and hard splice boundaries where signal statistics shift abruptly.
+  - ALL signals z-scored against the clip's OWN baseline (same as MAIA audio detector)
+  - Signal 7 compares FRAMES AGAINST EACH OTHER via sliding windows
+  - Audio signals compare WINDOWS AGAINST EACH OTHER — temporal coherence check
   - Minimum 2 corroborating signals required for MANIPULATED verdict.
-    Phoneme-viseme mismatch or splice_boundary alone are high-specificity exceptions.
 
 Author: Meghana Rabba — Illinois Institute of Technology / BLK-BX Research
 """
@@ -27,13 +32,17 @@ Author: Meghana Rabba — Illinois Institute of Technology / BLK-BX Research
 import cv2
 import numpy as np
 import mediapipe as mp
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, lfilter, butter
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
-import subprocess, tempfile, os, time, logging
+import subprocess, tempfile, os, time, logging, wave, struct
 
 logger = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VISEME TABLES
+# ─────────────────────────────────────────────────────────────────────────────
 
 VISEME_LAR_EXPECTED = {
     "bilabial_stop":  (0.00, 0.06),
@@ -57,6 +66,10 @@ def phoneme_to_viseme(word: str) -> str:
     if first in ("s","z"):    return "sibilant"
     return "other"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA CLASSES
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class WordTimestamp:
@@ -86,9 +99,34 @@ class FrameFeatures:
 
 
 @dataclass
+class AudioWindowFeatures:
+    window_idx: int
+    timestamp: float
+    f0_jitter: float = 0.0
+    hf_ratio: float = 0.0
+    spectral_flatness: float = 0.0
+    mfcc_delta: float = 0.0
+    zcr: float = 0.0
+    splice_score: float = 0.0
+    composite_score: float = 0.0
+    composite_z: float = 0.0
+
+
+@dataclass
 class AnomalySegment:
     start_frame: int
     end_frame: int
+    start_time: float
+    end_time: float
+    peak_z_score: float
+    triggered_signals: List[str]
+    confidence: str
+    description: str
+    modality: str = "video"   # "video" | "audio" | "audio+video"
+
+
+@dataclass
+class AudioAnomalySegment:
     start_time: float
     end_time: float
     peak_z_score: float
@@ -109,6 +147,19 @@ class PhonemeVisemeReport:
 
 
 @dataclass
+class AudioDetectionResult:
+    has_audio: bool
+    verdict: str                       # MANIPULATED / AUTHENTIC / INCONCLUSIVE / NO_AUDIO
+    overall_confidence: float
+    segments: List[AudioAnomalySegment]
+    window_features: List[AudioWindowFeatures]
+    per_signal_zscores: dict
+    summary: str
+    sample_rate: int = 0
+    duration_sec: float = 0.0
+
+
+@dataclass
 class DetectionResult:
     verdict: str
     overall_confidence: float
@@ -120,8 +171,13 @@ class DetectionResult:
     total_frames: int
     fps: float
     summary: str
+    audio_result: Optional[AudioDetectionResult] = None
     groq_transcript: Optional[str] = None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIDEO SIGNAL EXTRACTORS
+# ─────────────────────────────────────────────────────────────────────────────
 
 class LipGeometryExtractor:
     def extract(self, landmarks, frame_w: int, frame_h: int) -> Tuple[float, float]:
@@ -266,6 +322,321 @@ class PeriodicityAndSpliceAnalyzer:
         return scores
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUDIO SIGNAL EXTRACTOR (parallel to MAIA)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AudioFeatureExtractor:
+    """
+    Extracts 6 signals from raw audio — same approach as MAIA vocal deepfake detector.
+    Compares windows AGAINST EACH OTHER (temporal coherence) not just vs global mean.
+    """
+    WINDOW_MS  = 30    # 30ms windows (standard for speech)
+    HOP_MS     = 10    # 10ms hop
+    N_MFCC     = 13
+
+    def __init__(self, sr: int, samples: np.ndarray):
+        self.sr      = sr
+        self.samples = samples.astype(np.float32)
+        self.win_n   = int(sr * self.WINDOW_MS / 1000)
+        self.hop_n   = int(sr * self.HOP_MS    / 1000)
+
+    def _frames(self) -> List[np.ndarray]:
+        frames = []
+        n = len(self.samples)
+        start = 0
+        while start + self.win_n <= n:
+            frames.append(self.samples[start:start + self.win_n])
+            start += self.hop_n
+        return frames
+
+    def _f0_jitter(self, frame: np.ndarray) -> float:
+        """Pseudo-F0 via autocorrelation peak — jitter = instability between adjacent peaks."""
+        corr = np.correlate(frame, frame, mode='full')
+        corr = corr[len(corr)//2:]
+        min_lag = max(1, int(self.sr / 400))   # 400 Hz max F0
+        max_lag = int(self.sr / 50)            # 50 Hz min F0
+        if max_lag >= len(corr):
+            return 0.0
+        peak_idx = np.argmax(corr[min_lag:max_lag]) + min_lag
+        return float(corr[peak_idx] / (corr[0] + 1e-8))
+
+    def _hf_ratio(self, frame: np.ndarray) -> float:
+        """High-frequency energy ratio — GAN/TTS over-smoothing removes HF content."""
+        spec = np.abs(np.fft.rfft(frame * np.hanning(len(frame))))
+        total = spec.sum() + 1e-8
+        hf    = spec[len(spec)//2:].sum()
+        return float(hf / total)
+
+    def _spectral_flatness(self, frame: np.ndarray) -> float:
+        """Spectral flatness (Wiener entropy) — neural codec artifacts show anomalous flatness."""
+        spec = np.abs(np.fft.rfft(frame * np.hanning(len(frame)))) + 1e-8
+        geo_mean = np.exp(np.log(spec).mean())
+        arith_mean = spec.mean()
+        return float(geo_mean / arith_mean)
+
+    def _mfcc_delta(self, frame: np.ndarray) -> float:
+        """Simple mel-cepstral energy — proxy for MFCC shift."""
+        pre_emph = np.append(frame[0], frame[1:] - 0.97 * frame[:-1])
+        spec = np.abs(np.fft.rfft(pre_emph * np.hanning(len(pre_emph))))**2
+        n_mels = 26
+        freqs  = np.linspace(0, self.sr/2, len(spec))
+        mel_f  = np.linspace(0, 2595 * np.log10(1 + self.sr/2/700), n_mels + 2)
+        hz_f   = 700 * (10**(mel_f / 2595) - 1)
+        mel_energy = np.zeros(n_mels)
+        for m in range(n_mels):
+            lo = np.searchsorted(freqs, hz_f[m])
+            hi = np.searchsorted(freqs, hz_f[m+2])
+            if hi > lo:
+                mel_energy[m] = spec[lo:hi].mean()
+        return float(np.log(mel_energy[:self.N_MFCC] + 1e-8).mean())
+
+    def _zcr(self, frame: np.ndarray) -> float:
+        """Zero-crossing rate — anomalies indicate unnatural voicing transitions."""
+        signs  = np.sign(frame)
+        signs[signs == 0] = 1
+        return float(((signs[:-1] != signs[1:]).sum()) / len(frame))
+
+    def extract_all(self) -> List[AudioWindowFeatures]:
+        frames = self._frames()
+        if not frames:
+            return []
+        features = []
+        for i, fr in enumerate(frames):
+            ts = i * self.hop_n / self.sr
+            aw = AudioWindowFeatures(window_idx=i, timestamp=round(ts, 4))
+            aw.f0_jitter        = self._f0_jitter(fr)
+            aw.hf_ratio         = self._hf_ratio(fr)
+            aw.spectral_flatness= self._spectral_flatness(fr)
+            aw.mfcc_delta       = self._mfcc_delta(fr)
+            aw.zcr              = self._zcr(fr)
+            features.append(aw)
+
+        # Splice detection: compare windows against adjacent windows (cross-frame)
+        feat_mat = np.array([
+            [f.f0_jitter, f.hf_ratio, f.spectral_flatness, f.mfcc_delta, f.zcr]
+            for f in features
+        ], dtype=np.float64)
+
+        # Normalize
+        normed = np.zeros_like(feat_mat)
+        for col in range(feat_mat.shape[1]):
+            col_data = feat_mat[:, col]
+            mu, sig = col_data.mean(), col_data.std()
+            normed[:, col] = (col_data - mu) / (sig + 1e-8)
+
+        W = 20  # windows per side for splice check
+        N = len(features)
+        for i in range(W, N - W):
+            left  = normed[i-W:i]
+            right = normed[i:i+W]
+            col_scores = []
+            for col in range(normed.shape[1]):
+                mu_l, mu_r = left[:, col].mean(), right[:, col].mean()
+                std_l, std_r = left[:, col].std(), right[:, col].std()
+                pooled = np.sqrt((std_l**2 + std_r**2) / 2 + 1e-8)
+                col_scores.append(abs(mu_l - mu_r) / pooled)
+            features[i].splice_score = float(np.mean(col_scores))
+
+        return features
+
+
+class AudioDetector:
+    """
+    MAIA-parallel audio deepfake detector.
+    6 signals, all z-scored against clip's own baseline.
+    Compares windows against each other — not just vs global mean.
+    """
+
+    THRESHOLDS = {
+        "f0_jitter":         3.0,
+        "hf_ratio":          3.5,
+        "spectral_flatness": 3.5,
+        "mfcc_delta":        3.0,
+        "zcr":               3.2,
+        "splice":            2.5,
+    }
+
+    WEIGHTS = {
+        "f0":     0.25,
+        "hf":     0.20,
+        "flat":   0.15,
+        "mfcc":   0.20,
+        "zcr":    0.10,
+        "splice": 0.10,
+    }
+
+    def _zscore(self, values: List[float]) -> List[float]:
+        arr = np.array(values, dtype=np.float64)
+        mu, sig = arr.mean(), arr.std()
+        if sig < 1e-8: sig = 1e-8
+        return ((arr - mu) / sig).tolist()
+
+    def _extract_raw_audio(self, video_path: str) -> Tuple[Optional[np.ndarray], int]:
+        """Extract raw PCM audio from video using ffmpeg → wav → numpy."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", video_path,
+                 "-ar", "16000", "-ac", "1", "-f", "wav", tmp.name],
+                capture_output=True, timeout=60
+            )
+            if r.returncode != 0 or os.path.getsize(tmp.name) < 1000:
+                return None, 0
+            # Read WAV manually
+            with wave.open(tmp.name, 'rb') as wf:
+                sr     = wf.getframerate()
+                n_ch   = wf.getnchannels()
+                n_samp = wf.getnframes()
+                raw    = wf.readframes(n_samp)
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if n_ch > 1:
+                samples = samples.reshape(-1, n_ch).mean(axis=1)
+            return samples, sr
+        except Exception as e:
+            logger.warning(f"Audio extraction error: {e}")
+            return None, 0
+        finally:
+            try: os.unlink(tmp.name)
+            except: pass
+
+    def detect(self, video_path: str) -> AudioDetectionResult:
+        samples, sr = self._extract_raw_audio(video_path)
+
+        if samples is None or len(samples) < sr * 0.5:  # < 0.5s audio
+            return AudioDetectionResult(
+                has_audio=False, verdict="NO_AUDIO", overall_confidence=0.0,
+                segments=[], window_features=[], per_signal_zscores={},
+                summary="No audio track detected or audio too short.", sr=0, duration_sec=0.0
+            )
+
+        extractor = AudioFeatureExtractor(sr, samples)
+        windows   = extractor.extract_all()
+        duration  = len(samples) / sr
+
+        if len(windows) < 30:
+            return AudioDetectionResult(
+                has_audio=True, verdict="INCONCLUSIVE", overall_confidence=0.0,
+                segments=[], window_features=windows, per_signal_zscores={},
+                summary="Audio too short for reliable analysis.",
+                sample_rate=sr, duration_sec=round(duration, 2)
+            )
+
+        zs = {
+            "f0":     self._zscore([w.f0_jitter          for w in windows]),
+            "hf":     self._zscore([w.hf_ratio            for w in windows]),
+            "flat":   self._zscore([w.spectral_flatness   for w in windows]),
+            "mfcc":   self._zscore([w.mfcc_delta          for w in windows]),
+            "zcr":    self._zscore([w.zcr                 for w in windows]),
+            "splice": self._zscore([w.splice_score        for w in windows]),
+        }
+
+        thr = self.THRESHOLDS
+        for i, w in enumerate(windows):
+            w.composite_score = (
+                abs(zs["f0"][i])     * self.WEIGHTS["f0"]  +
+                abs(zs["hf"][i])     * self.WEIGHTS["hf"]  +
+                abs(zs["flat"][i])   * self.WEIGHTS["flat"] +
+                abs(zs["mfcc"][i])   * self.WEIGHTS["mfcc"] +
+                abs(zs["zcr"][i])    * self.WEIGHTS["zcr"]  +
+                abs(zs["splice"][i]) * self.WEIGHTS["splice"]
+            )
+
+        comp_z = self._zscore([w.composite_score for w in windows])
+        for i, w in enumerate(windows):
+            w.composite_z = comp_z[i]
+
+        # Peak detection
+        comp_arr   = np.array(comp_z)
+        diff_arr   = np.abs(np.diff(comp_arr, prepend=comp_arr[0]))
+        diff_peaks, _ = find_peaks(diff_arr, height=2.5, distance=30)
+        comp_peaks, _ = find_peaks(comp_arr,  height=2.2, distance=30)
+        all_peaks = sorted(set(diff_peaks.tolist() + comp_peaks.tolist()))
+
+        merged = []
+        for p in all_peaks:
+            if not merged or p - merged[-1] > 20:
+                merged.append(p)
+            elif abs(comp_z[p]) > abs(comp_z[merged[-1]]):
+                merged[-1] = p
+
+        # Build audio anomaly segments
+        segments: List[AudioAnomalySegment] = []
+        WIN_HALF = 15
+
+        for pi in merged:
+            ws = max(0, pi - WIN_HALF)
+            we = min(len(windows)-1, pi + WIN_HALF)
+            pkz = max(abs(comp_z[i]) for i in range(ws, we+1))
+
+            triggered = []
+            for i in range(ws, we+1):
+                if abs(zs["f0"][i])     > thr["f0_jitter"]          and "f0_jitter_anomaly"       not in triggered: triggered.append("f0_jitter_anomaly")
+                if abs(zs["hf"][i])     > thr["hf_ratio"]           and "hf_smoothing"             not in triggered: triggered.append("hf_smoothing")
+                if abs(zs["flat"][i])   > thr["spectral_flatness"]  and "spectral_flatness_anomaly" not in triggered: triggered.append("spectral_flatness_anomaly")
+                if abs(zs["mfcc"][i])   > thr["mfcc_delta"]         and "mfcc_drift"               not in triggered: triggered.append("mfcc_drift")
+                if abs(zs["zcr"][i])    > thr["zcr"]                and "zcr_anomaly"              not in triggered: triggered.append("zcr_anomaly")
+                if abs(zs["splice"][i]) > thr["splice"]             and "audio_splice_boundary"    not in triggered: triggered.append("audio_splice_boundary")
+
+            if not triggered:
+                continue
+            high_spec = {"audio_splice_boundary"}
+            if len([s for s in triggered if s in high_spec]) == 0 and len(triggered) < 2:
+                continue
+
+            conf  = "high" if len(triggered)>=3 else "medium" if len(triggered)==2 else "low"
+            ts_   = windows[ws].timestamp
+            te_   = windows[we].timestamp
+            parts = []
+            if "f0_jitter_anomaly"        in triggered: parts.append(f"F0 jitter anomaly (z={abs(zs['f0'][pi]):.2f})")
+            if "hf_smoothing"             in triggered: parts.append(f"HF energy smoothing (z={abs(zs['hf'][pi]):.2f})")
+            if "spectral_flatness_anomaly"in triggered: parts.append(f"spectral flatness spike (z={abs(zs['flat'][pi]):.2f})")
+            if "mfcc_drift"               in triggered: parts.append(f"MFCC drift (z={abs(zs['mfcc'][pi]):.2f})")
+            if "zcr_anomaly"              in triggered: parts.append(f"ZCR anomaly (z={abs(zs['zcr'][pi]):.2f})")
+            if "audio_splice_boundary"    in triggered: parts.append(f"audio splice boundary (shift={windows[pi].splice_score:.2f})")
+
+            segments.append(AudioAnomalySegment(
+                start_time=round(ts_,3), end_time=round(te_,3),
+                peak_z_score=round(pkz,3), triggered_signals=triggered,
+                confidence=conf, description=f"Audio anomaly t={ts_:.2f}s–{te_:.2f}s: " + "; ".join(parts)
+            ))
+
+        # Verdict
+        hi  = [s for s in segments if s.confidence=="high"]
+        med = [s for s in segments if s.confidence=="medium"]
+        if hi:
+            verdict = "MANIPULATED"; conf_ = min(0.95, 0.65 + 0.08*len(hi))
+        elif med:
+            verdict = "MANIPULATED"; conf_ = min(0.78, 0.50 + 0.08*len(med))
+        elif segments:
+            verdict, conf_ = "INCONCLUSIVE", 0.40
+        else:
+            verdict, conf_ = "AUTHENTIC", 0.82
+
+        summary = (f"Audio {verdict} — {len(segments)} anomaly segment(s) in "
+                   f"{round(duration,1)}s of audio. Confidence: {conf_:.0%}.")
+
+        return AudioDetectionResult(
+            has_audio=True, verdict=verdict, overall_confidence=round(conf_,3),
+            segments=segments, window_features=windows,
+            per_signal_zscores={
+                "f0_jitter":         [round(z,3) for z in zs["f0"]],
+                "hf_ratio":          [round(z,3) for z in zs["hf"]],
+                "spectral_flatness": [round(z,3) for z in zs["flat"]],
+                "mfcc_delta":        [round(z,3) for z in zs["mfcc"]],
+                "zcr":               [round(z,3) for z in zs["zcr"]],
+                "audio_splice":      [round(z,3) for z in zs["splice"]],
+                "audio_composite":   [round(z,3) for z in comp_z],
+            },
+            summary=summary, sample_rate=sr, duration_sec=round(duration,2)
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHONEME-VISEME (Groq Whisper signal 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class PhonemeVisemeMatcher:
     def __init__(self, groq_api_key: Optional[str] = None):
         self.groq_api_key = groq_api_key or os.environ.get("GROQ_API_KEY")
@@ -388,17 +759,33 @@ class PhonemeVisemeMatcher:
         return scores, report, transcript
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN DETECTOR
+# ─────────────────────────────────────────────────────────────────────────────
+
 class FauxPixDetector:
     """
-    7-signal segment-level partial video deepfake detector.
+    Combined Audio + Video deepfake detector.
 
-    Signals 1-6: per-frame z-scored against clip baseline.
-    Signal 7:    cross-frame sliding window — compares frames AGAINST EACH OTHER
-                 to find GAN periodicity (rhythm) and splice boundaries (hard cuts).
+    VIDEO — 7 signals (all z-scored vs clip baseline, Signal 7 cross-frame):
+      1. Lip Geometry
+      2. Laplacian Variance (GAN texture)
+      3. FFT Peak Score (GAN frequency)
+      4. Landmark Velocity (FFD)
+      5. Temporal Gradient
+      6. Phoneme-Viseme Sync (Groq Whisper — MAIA bridge)
+      7. Periodicity + Splice (cross-frame, frames vs frames)
 
-    Verdict:
+    AUDIO — 6 signals (all z-scored vs clip baseline, windows vs windows):
+      A. F0 Jitter
+      B. HF Ratio
+      C. Spectral Flatness
+      D. MFCC Delta
+      E. ZCR
+      F. Audio Splice Boundary
+
+    Verdict logic:
       MANIPULATED   — 2+ signals corroborate, OR high-specificity signal alone
-                      (phoneme-viseme mismatch, splice_boundary)
       INCONCLUSIVE  — 1 low-specificity signal only
       AUTHENTIC     — no signals triggered
     """
@@ -435,6 +822,7 @@ class FauxPixDetector:
         self.temporal_analyzer    = TemporalGradientAnalyzer()
         self.pv_matcher           = PhonemeVisemeMatcher(groq_api_key)
         self.periodicity_analyzer = PeriodicityAndSpliceAnalyzer()
+        self.audio_detector       = AudioDetector()
 
     def _get_face_bbox(self, detections, fw, fh):
         if not detections:
@@ -472,6 +860,11 @@ class FauxPixDetector:
 
     def detect(self, video_path: str) -> DetectionResult:
         t0  = time.time()
+
+        # ── AUDIO detection (parallel, independent) ───────────────────────────
+        audio_result = self.audio_detector.detect(video_path)
+
+        # ── VIDEO Pass 1: visual signals 1-5 ─────────────────────────────────
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -481,7 +874,6 @@ class FauxPixDetector:
         self.landmark_tracker.prev        = None
         self.temporal_analyzer.prev_frame = None
 
-        # ── Pass 1: visual signals 1-5 ────────────────────────────────────────
         with self.mp_face_mesh.FaceMesh(
             static_image_mode=False, max_num_faces=1, refine_landmarks=True,
             min_detection_confidence=0.4, min_tracking_confidence=0.4
@@ -515,7 +907,8 @@ class FauxPixDetector:
                 verdict="INCONCLUSIVE", overall_confidence=0.0, segments=[],
                 frame_features=feats, per_signal_zscores={},
                 phoneme_viseme_report=None, processing_time=round(time.time()-t0,2),
-                total_frames=fi, fps=fps, summary="Insufficient frames."
+                total_frames=fi, fps=fps, summary="Insufficient frames.",
+                audio_result=audio_result
             )
 
         # ── Signal 7: cross-frame periodicity + splice ────────────────────────
@@ -579,7 +972,6 @@ class FauxPixDetector:
         comp_peaks, _ = find_peaks(np.array(comp_z),  height=2.5, distance=int(fps*0.8))
         all_peaks  = sorted(set(diff_peaks.tolist() + comp_peaks.tolist()))
 
-        # Merge peaks within 1s of each other, keep highest
         merged_peaks = []
         for p in all_peaks:
             if not merged_peaks or p - merged_peaks[-1] > int(fps):
@@ -611,7 +1003,6 @@ class FauxPixDetector:
                 if has_groq:
                     _flag("phoneme_viseme_mismatch", "pv",  "phoneme_viseme_mismatch")
 
-            # Signal 7 — raw scores (not z-scores, already calibrated)
             win_period = float(np.mean([feats[i].periodicity_score for i in range(ws, we+1)]))
             win_splice = float(np.mean([feats[i].splice_score      for i in range(ws, we+1)]))
             if win_period > thr["periodicity"]:
@@ -622,11 +1013,10 @@ class FauxPixDetector:
             if not triggered:
                 continue
 
-            # High-specificity signals that count alone
             high_spec = {"phoneme_viseme_mismatch", "splice_boundary"}
             n_high = len([s for s in triggered if s in high_spec])
             if n_high == 0 and len(triggered) < 2:
-                continue  # single low-spec signal — inconclusive, skip
+                continue
 
             conf  = "high" if len(triggered)>=3 else "medium" if len(triggered)==2 else "low"
             ts_   = feats[ws].timestamp
@@ -649,15 +1039,23 @@ class FauxPixDetector:
             if "splice_boundary"           in triggered:
                 parts.append(f"splice boundary detected (shift={win_splice:.2f})")
 
+            # Check if this segment overlaps with an audio anomaly
+            has_audio_overlap = any(
+                not (te_ < aseg.start_time or ts_ > aseg.end_time)
+                for aseg in audio_result.segments
+            ) if audio_result else False
+            modality = "audio+video" if has_audio_overlap else "video"
+
             segments.append(AnomalySegment(
                 start_frame=ws, end_frame=we,
                 start_time=round(ts_,3), end_time=round(te_,3),
                 peak_z_score=round(pkz,3), triggered_signals=triggered,
                 confidence=conf,
-                description=f"Anomaly t={ts_:.2f}s–{te_:.2f}s: " + "; ".join(parts)
+                description=f"Anomaly t={ts_:.2f}s–{te_:.2f}s: " + "; ".join(parts),
+                modality=modality
             ))
 
-        # ── Verdict ───────────────────────────────────────────────────────────
+        # ── Combined verdict ──────────────────────────────────────────────────
         hi  = [s for s in segments if s.confidence=="high"]
         med = [s for s in segments if s.confidence=="medium"]
         pv_fired = any("phoneme_viseme_mismatch" in s.triggered_signals for s in segments)
@@ -673,10 +1071,18 @@ class FauxPixDetector:
         else:
             verdict, conf_ = "AUTHENTIC", (0.87 if has_groq else 0.82)
 
+        # Boost confidence if audio also flagged as manipulated
+        if audio_result and audio_result.verdict == "MANIPULATED" and verdict == "MANIPULATED":
+            conf_ = min(0.99, conf_ + 0.05)
+        elif audio_result and audio_result.verdict == "MANIPULATED" and verdict == "AUTHENTIC":
+            verdict = "INCONCLUSIVE"
+            conf_   = 0.55
+
         groq_note = (" (Groq Whisper phoneme-viseme: ACTIVE)" if has_groq
                      else " (Groq Whisper: not configured — set GROQ_API_KEY)")
-        summary = (f"{verdict} — {len(segments)} anomaly segment(s) across "
-                   f"{fi} frames ({fi/fps:.1f}s). Confidence: {conf_:.0%}.{groq_note}")
+        audio_note = f" Audio: {audio_result.verdict}." if audio_result else ""
+        summary = (f"VIDEO {verdict} — {len(segments)} anomaly segment(s) across "
+                   f"{fi} frames ({fi/fps:.1f}s). Confidence: {conf_:.0%}.{groq_note}{audio_note}")
 
         return DetectionResult(
             verdict=verdict, overall_confidence=round(conf_,3),
@@ -695,5 +1101,6 @@ class FauxPixDetector:
             phoneme_viseme_report=pv_report,
             processing_time=round(time.time()-t0,2),
             total_frames=fi, fps=fps, summary=summary,
+            audio_result=audio_result,
             groq_transcript=transcript,
         )
