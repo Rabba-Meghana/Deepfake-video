@@ -384,22 +384,17 @@ class FauxPixDetector:
         return (x, y, w, h)
 
     def _zscore_series(self, values: List[float], baseline_frac: float = 0.3) -> List[float]:
-        """Per-clip self-referential z-scoring — the core innovation.
-        Uses the MIDDLE of the clip as baseline (most stable region),
-        not the start which can have recording startup artifacts.
+        """Per-clip self-referential z-scoring — same as audio detector.
+        Each frame scored against the GLOBAL clip mean/std (all frames).
+        This is how the audio detector works: every 0.5s window is compared
+        against the whole clip baseline, not a fixed region.
+        Robust to startup artifacts, lighting changes, compression noise.
         """
-        arr  = np.array(values, dtype=np.float64)
-        n    = len(arr)
-        # Middle 30% of clip — avoids startup/shutdown artifacts
-        mid_start = int(n * 0.35)
-        mid_end   = int(n * 0.65)
-        baseline  = arr[mid_start:mid_end]
-        if len(baseline) < 5:
-            baseline = arr
-        mu   = baseline.mean()
-        sig  = baseline.std()
+        arr = np.array(values, dtype=np.float64)
+        mu  = arr.mean()
+        sig = arr.std()
         if sig < 1e-8:
-            sig = arr.std() + 1e-8
+            sig = 1e-8
         return ((arr - mu) / sig).tolist()
 
     def _composite(self, i: int, zs: dict, has_groq: bool) -> float:
