@@ -356,11 +356,11 @@ class FauxPixDetector:
     """
 
     THRESHOLDS = {
-        "lip_aspect_ratio":        2.0,
-        "laplacian_var":           2.0,
-        "fft_peak_score":          2.0,
-        "landmark_velocity":       2.2,
-        "temporal_gradient":       2.0,
+        "lip_aspect_ratio":        2.8,
+        "laplacian_var":           2.8,
+        "fft_peak_score":          2.8,
+        "landmark_velocity":       3.0,
+        "temporal_gradient":       2.8,
         "phoneme_viseme_mismatch": 1.8,
     }
     WEIGHTS = {"lip_ar":0.20, "lap":0.12, "fft":0.12, "vel":0.20, "tg":0.12, "pv":0.24}
@@ -494,7 +494,7 @@ class FauxPixDetector:
 
         # ── Peak detection ────────────────────────────────────────────────────
         diff_sig = np.abs(np.diff(np.array(comp_z), prepend=comp_z[0]))
-        peaks, _ = find_peaks(diff_sig, height=1.8, distance=int(fps*0.5))
+        peaks, _ = find_peaks(diff_sig, height=2.5, distance=int(fps*1.0))
 
         # ── Anomaly segments ──────────────────────────────────────────────────
         segments: List[AnomalySegment] = []
