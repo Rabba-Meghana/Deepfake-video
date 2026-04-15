@@ -1,190 +1,193 @@
 # FauxPix 🎬 — Partial Video Deepfake Detector
 
-**Segment-level video deepfake detection using signal-processing-first, per-clip z-scoring.**
+**6-signal segment-level video deepfake detection.**  
+Detects *where* manipulation was injected — not just whether a clip is fake.
 
-> Detects *where* manipulation was injected — not just whether a clip is fake.
+Signal 6 uses **Groq Whisper** (same API as the companion audio detector) for phoneme-viseme synchrony analysis — the direct bridge between audio and video deepfake detection.
 
 ---
 
-## Demo Results (Real Output)
+## Real Output
 
 ```
-Video: test_partial_deepfake.mp4 (8.0s, simulated splice at t=3.8s–5.2s)
-
-Verdict:     MANIPULATED
-Confidence:  95%
-Segments:    6 anomaly segments detected
+Video:      test_partial_deepfake.mp4 (8s, splice injected at t=3.8s–5.2s)
+Verdict:    MANIPULATED
+Confidence: 95%
+Segments:   6 anomaly segments detected
 
 [HIGH] t=3.24s–4.72s | lip_sync_anomaly, texture_smoothing, gan_frequency_artifact | z=1.84
 [HIGH] t=5.40s–6.88s | texture_smoothing, gan_frequency_artifact, temporal_gradient  | z=2.21
 ```
 
-→ Full output: [`sample_output/sample_output.json`](sample_output/sample_output.json)
+Full output → [`sample_output/sample_output.json`](sample_output/sample_output.json)
 
 ---
 
 ## Architecture
 
-FauxPix mirrors the partial audio deepfake detection philosophy — **per-clip self-referential z-scoring** — extended to 5 video-domain signals.
-
 ```
 Video Input
     │
-    ├── [Signal 1] Lip Geometry         ← phoneme-viseme proxy (audio: F0 jitter)
-    ├── [Signal 2] Laplacian Variance   ← GAN over-smoothing (audio: hf_ratio_z)
-    ├── [Signal 3] FFT Peak Score       ← GAN frequency fingerprint (audio: MFCC shift)
-    ├── [Signal 4] Landmark Velocity    ← facial feature drift (audio: F0 jitter)
-    └── [Signal 5] Temporal Gradient   ← face/bg ratio anomaly (audio: spectral flatness z)
-         │
+    ├── [S1] Lip Geometry (MediaPipe)        ← phoneme-viseme proxy    (audio: F0 jitter)
+    ├── [S2] Laplacian Variance              ← GAN over-smoothing       (audio: hf_ratio_z)
+    ├── [S3] FFT Peak Score                  ← GAN frequency fingerprint(audio: MFCC shift)
+    ├── [S4] Landmark Velocity               ← Facial Feature Drift     (audio: F0 jitter)
+    ├── [S5] Temporal Gradient               ← face vs bg ratio         (audio: spectral flatness)
+    └── [S6] Phoneme-Viseme Sync (Groq)  ★  ← Whisper timestamps × lip shape
+         │                                       KEY SIGNAL — MAIA ↔ FauxPix bridge
          ▼
-    Per-clip Z-scoring (baseline = first 30% of clip)
-         │
+    Per-clip self-referential z-scoring  ← core innovation
          ▼
-    Composite Score → Differential → Peak Detection
-         │
+    Composite score → differential → find_peaks()
          ▼
-    Anomaly Segments with timestamps + confidence + triggered signals
-         │
+    Anomaly segments: timestamp + confidence + triggered signals
          ▼
-    Forensic Report JSON
+    Forensic JSON report
 ```
 
-### Key Innovation: Per-Clip Self-Referential Z-Scoring
+### Core Innovation: Per-Clip Self-Referential Z-Scoring
 
-Most detectors compare features against a universal trained reference. This fails on:
-- Compressed body cam footage
-- Low-resolution surveillance video
-- Phone call recordings
-- Variable lighting / noisy environments
+Every signal is z-scored against **the same clip's own baseline** (first 30% of frames).  
+Works on: compressed body cam footage · surveillance video · phone recordings · variable lighting.  
+*Same philosophy as the companion partial audio deepfake detector.*
 
-FauxPix z-scores every signal against **the same clip's own baseline** (first 30% of frames). The question becomes: *"Is this window anomalous for this clip?"* — not *"Is this anomalous in absolute terms?"*
+### Signal 6: Groq Whisper Phoneme-Viseme
 
-This makes FauxPix robust to field conditions — critical for law enforcement deployments.
+1. Extract audio from video via ffmpeg
+2. Send to `whisper-large-v3-turbo` on Groq → **word-level timestamps**
+3. Map each word's first phoneme to expected viseme (lip shape)
+4. Check MediaPipe lip aspect ratio at that frame
+5. If actual LAR outside expected range → **phoneme-viseme mismatch**
+
+High-value phonemes: bilabials (`b`,`p`,`m`) require closed lips (LAR < 0.06).  
+If Groq says `"been"` is being spoken but lips are open → lip-sync deepfake confirmed.
+
+**Bridge to MAIA:** When MAIA flags audio synthesis at t=4.0s AND FauxPix flags phoneme-viseme mismatch at t=4.0s → dual-modality forensic evidence from independent signal domains.
 
 ---
 
 ## Signal Reference
 
-| Signal | What It Detects | Audio Analogue | Threshold |
-|--------|----------------|----------------|-----------|
-| Lip Geometry | Phoneme-viseme mismatch (Wav2Lip, VideoRetalking) | F0 jitter discontinuity | z > 2.0 |
-| Laplacian Variance | GAN over-smoothing of face texture | hf_ratio_z (neural vocoder HF suppression) | z > 2.0 |
-| FFT Peak Score | GAN upsampling frequency fingerprint | MFCC vocoder fingerprint shift | z > 2.0 |
-| Landmark Velocity | Facial Feature Drift between frames | F0 jitter at splice boundary | z > 2.2 |
-| Temporal Gradient | Face vs background motion inconsistency | Spectral flatness z-score | z > 2.0 |
-
----
-
-## Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Detection engine | Python · MediaPipe · OpenCV · NumPy · SciPy |
-| API backend | FastAPI · Uvicorn |
-| Frontend | React + Vite |
-| Face tracking | MediaPipe Face Mesh (468 landmarks) |
-| Face detection | MediaPipe Face Detection |
-| Splice localization | `scipy.signal.find_peaks` on composite z-score differential |
+| # | Signal | Targets | Audio Analogue | Threshold |
+|---|--------|---------|----------------|-----------|
+| 1 | Lip Geometry | Wav2Lip, VideoRetalking | F0 jitter | z > 2.0 |
+| 2 | Laplacian Variance | GAN face synthesis | hf_ratio_z | z > 2.0 |
+| 3 | FFT Peak Score | StyleGAN, diffusion models | MFCC vocoder shift | z > 2.0 |
+| 4 | Landmark Velocity (FFD) | Face reenactment | F0 jitter | z > 2.2 |
+| 5 | Temporal Gradient | All compositing deepfakes | Spectral flatness z | z > 2.0 |
+| 6 | **Phoneme-Viseme (Groq)** | **Lip-sync deepfakes** | **MAIA audio detection** | **z > 1.8** |
 
 ---
 
 ## Quickstart
 
-### Backend
+### 1. Get a free Groq API key
+Go to [console.groq.com](https://console.groq.com) → Create API key → copy it.  
+*(Same key works for audio detector + FauxPix Signal 6)*
+
+### 2. Backend
 ```bash
 cd backend
 pip install -r requirements.txt
+
+# With Groq (all 6 signals):
+GROQ_API_KEY=gsk_your_key uvicorn main:app --reload
+
+# Without Groq (5 signals, no key needed):
 uvicorn main:app --reload
-# API running at http://localhost:8000
-# Docs at http://localhost:8000/docs
 ```
 
-### Frontend
+API docs: http://localhost:8000/docs
+
+### 3. Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
-# UI running at http://localhost:5173
+# Open http://localhost:5173
+# Paste Groq key in the UI field, drop a video, run detection
 ```
 
-### CLI / Script
+### 4. Python (direct)
 ```python
-from backend.detector import FauxPixDetector
+import os
+os.environ["GROQ_API_KEY"] = "gsk_your_key"   # optional
 
-det = FauxPixDetector()
+from backend.detector import FauxPixDetector
+det    = FauxPixDetector()
 result = det.detect("your_video.mp4")
 
-print(result.verdict)           # "MANIPULATED" | "AUTHENTIC" | "INCONCLUSIVE"
+print(result.verdict)            # MANIPULATED / AUTHENTIC / INCONCLUSIVE
 print(result.overall_confidence)
 for seg in result.segments:
-    print(f"t={seg.start_time}s–{seg.end_time}s: {seg.triggered_signals}")
+    print(f"t={seg.start_time}s–{seg.end_time}s | {seg.triggered_signals}")
+
+# Groq phoneme-viseme report
+if result.phoneme_viseme_report:
+    pv = result.phoneme_viseme_report
+    print(f"Transcript: {pv.transcript}")
+    print(f"Mismatches: {pv.mismatch_count}/{pv.word_count} words ({pv.mismatch_rate:.1%})")
 ```
 
 ---
 
-## API Reference
+## API
 
 ```
-POST /detect          Upload video, returns full detection result
-GET  /signals         Signal documentation with audio analogues
-GET  /health          Health check
-GET  /docs            Auto-generated API docs (Swagger)
+POST /detect          Upload video (pass X-Groq-Api-Key header for Signal 6)
+GET  /signals         All 6 signal descriptions with audio analogues
+GET  /health          Health check + groq_configured status
+GET  /docs            Swagger UI
 ```
 
-### Response Schema
+### Response (key fields)
 ```json
 {
   "verdict": "MANIPULATED",
   "overall_confidence": 0.95,
-  "summary": "MANIPULATED — 6 anomaly segment(s) detected...",
-  "anomaly_segments": [
-    {
-      "start_time": 3.24,
-      "end_time": 4.72,
-      "peak_z_score": 1.839,
-      "confidence": "high",
-      "triggered_signals": ["lip_sync_anomaly", "texture_smoothing", "gan_frequency_artifact"],
-      "description": "Anomaly at t=3.24s-4.72s: lip geometry deviation (z=1.84); GAN texture smoothing (z=2.21)"
-    }
-  ],
-  "per_signal_zscores": { "lip_aspect_ratio": [...], "composite": [...] }
+  "groq_transcript": "I have never and will never sell user data",
+  "anomaly_segments": [{
+    "start_time": 4.0, "end_time": 5.5,
+    "confidence": "high",
+    "triggered_signals": ["phoneme_viseme_mismatch", "lip_sync_anomaly", "landmark_jitter"],
+    "description": "Anomaly t=4.00s–5.50s: phoneme-viseme mismatch (z=2.31) — Groq Whisper; lip geometry deviation (z=1.94)"
+  }],
+  "phoneme_viseme_report": {
+    "transcript": "...",
+    "word_count": 42,
+    "mismatch_count": 7,
+    "mismatch_rate": 0.167,
+    "mismatches": [{"word":"been","time":4.02,"viseme_group":"bilabial_stop","actual_lar":0.21,"expected_range":[0,0.06]}]
+  }
 }
 ```
 
 ---
 
-## Datasets for Evaluation
+## Evaluation Datasets
 
-| Dataset | What to Test |
+| Dataset | Relevant For |
 |---------|-------------|
-| [FaceForensics++](https://github.com/ondyari/FaceForensics) | Face swap + reenactment (c23/c40 compression) |
-| [FakeAVCeleb](https://github.com/DASH-Lab/FakeAVCeleb) | Audio-visual multimodal (RVFA, FVFA) |
-| [LAV-DF](https://github.com/ControlNet/LAV-DF) | **Localized A-V partial deepfakes** — directly analogous to this architecture |
-| [DF40](https://github.com/YZY-stack/DF40) | 40 deepfake methods — generalization test |
+| [FaceForensics++](https://github.com/ondyari/FaceForensics) | Standard benchmark (c23/c40 compression) |
+| [FakeAVCeleb](https://github.com/DASH-Lab/FakeAVCeleb) | Multimodal — RVFA, FVFA categories |
+| [LAV-DF](https://github.com/ControlNet/LAV-DF) | **Localized A-V partial deepfakes** — directly matches this architecture |
+| [DF40](https://github.com/YZY-stack/DF40) | 40 methods — generalization test |
 
 ---
 
-## Connection to Audio Deepfake Detection
+## Connection to Audio Detector
 
-This project is the video extension of a partial audio deepfake detector
-([Deepfake-Detector](https://github.com/Rabba-Meghana/Deepfake-Detector)).
-
-| Audio Domain | Video Domain |
-|-------------|-------------|
-| MFCC vocoder fingerprint shift | FFT GAN frequency fingerprint |
-| HF energy ratio (hf_ratio_z) | Laplacian variance (texture smoothing) |
+| Audio ([Deepfake-Detector](https://github.com/Rabba-Meghana/Deepfake-Detector)) | Video (FauxPix) |
+|---|---|
+| MFCC vocoder fingerprint | FFT GAN frequency fingerprint |
+| hf_ratio_z (HF energy) | Laplacian variance (texture smoothing) |
 | F0 jitter at splice boundary | Landmark velocity spike (FFD) |
 | Spectral flatness z-score | Temporal gradient face/bg ratio |
-| Splice boundary peak detection | Composite z-score differential peaks |
-| Per-clip baseline z-scoring | Per-clip baseline z-scoring (same) |
+| Groq Whisper transcription | Groq Whisper phoneme timestamps |
+| Per-clip baseline z-scoring | Per-clip baseline z-scoring |
 
-When combined with audio detection: **dual-modality forensic evidence** — both systems
-flag the same timestamp independently, producing court-admissible chain-of-evidence documentation.
+**Dual-modality forensic report:** MAIA catches audio synthesis + FauxPix catches visual manipulation at the same timestamp → independent confirmation from two signal domains.
 
 ---
 
-## Author
-
-**Meghana Rabba**  
-MS Computer Science, Illinois Institute of Technology, Chicago  
-mrabba@hawk.illinoistech.edu
+**Meghana Rabba** · MS CS, Illinois Institute of Technology · mrabba@hawk.illinoistech.edu
