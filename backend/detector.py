@@ -449,20 +449,20 @@ class AudioDetector:
     """
 
     THRESHOLDS = {
-        "f0_jitter":         3.0,
-        "hf_ratio":          3.5,
-        "spectral_flatness": 3.5,
-        "mfcc_delta":        3.0,
-        "zcr":               3.2,
-        "splice":            2.5,
+        "f0_jitter":         3.5,   # raised: real speech has natural jitter variation
+        "hf_ratio":          4.5,   # raised: .mov/.mp4 compression naturally smooths HF
+        "spectral_flatness": 4.0,   # raised: codec artifacts cause flatness spikes
+        "mfcc_delta":        3.5,   # raised: temporal MFCC drift common in compressed audio
+        "zcr":               4.5,   # raised: screen recording re-encoding changes ZCR profile
+        "splice":            3.0,   # raised slightly: still sensitive to true edit boundaries
     }
 
     WEIGHTS = {
-        "f0":     0.25,
-        "hf":     0.20,
+        "f0":     0.30,
+        "hf":     0.15,   # lowered: less weight on HF which fires on compression
         "flat":   0.15,
-        "mfcc":   0.20,
-        "zcr":    0.10,
+        "mfcc":   0.25,
+        "zcr":    0.05,   # lowered: ZCR unreliable on re-encoded audio
         "splice": 0.10,
     }
 
@@ -581,8 +581,15 @@ class AudioDetector:
 
             if not triggered:
                 continue
-            high_spec = {"audio_splice_boundary"}
-            if len([s for s in triggered if s in high_spec]) == 0 and len(triggered) < 2:
+            # High-specificity signals that can trigger MANIPULATED alone
+            high_spec = {"audio_splice_boundary", "f0_jitter_anomaly"}
+            # HF smoothing + ZCR together is a compression artifact pattern, NOT a deepfake signal
+            # Require either: a high-specificity signal, OR 3+ signals, OR HF/ZCR + something else
+            compression_only = set(triggered) <= {"hf_smoothing", "zcr_anomaly"}
+            has_high_spec = bool(set(triggered) & high_spec)
+            if compression_only:
+                continue  # skip — this is .mov/.mp4 re-encoding artifact, not manipulation
+            if not has_high_spec and len(triggered) < 2:
                 continue
 
             conf  = "high" if len(triggered)>=3 else "medium" if len(triggered)==2 else "low"
