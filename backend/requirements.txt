@@ -2,8 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 opencv-python-headless==4.10.0.84
-mediapipe==0.10.14
+mediapipe==0.10.13
 numpy==1.26.4
 scipy==1.14.1
+librosa>=0.10.0
 groq>=0.9.0
 ffmpeg-python>=0.2.0
